@@ -1,0 +1,181 @@
+import { execSync, spawn } from "child_process";
+import fs from "fs";
+import path from "path";
+
+const TOKEN = process.env.GITHUB_TOKEN;
+const CODESPACE_NAME = process.env.CODESPACE_NAME;
+const HOME = process.env.HOME;
+const PROJECT_PATH = path.join(HOME, "nexus-cli");
+const LOG_PATH = path.join(HOME, "auto.log");
+
+const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 phút
+const RESTART_INTERVAL = 5 * 60 * 60 * 1000 + 50 * 60 * 1000; // 5h50m
+
+function log(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  process.stdout.write(line);
+  fs.appendFileSync(LOG_PATH, line);
+}
+
+function run(cmd, opts = {}) {
+  log(`⚙️  ${cmd}`);
+  return execSync(cmd, { stdio: "inherit", ...opts });
+}
+
+const SETUP_RS_CONTENT = `//! Session setup and initialization
+use crate::analytics::set_wallet_address_for_reporting;
+use crate::config::Config;
+use crate::environment::Environment;
+use crate::events::Event;
+use crate::orchestrator::OrchestratorClient;
+use crate::runtime::start_authenticated_worker;
+use ed25519_dalek::SigningKey;
+use std::error::Error;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+
+#[derive(Debug)]
+pub struct SessionData {
+    pub event_receiver: mpsc::Receiver<Event>,
+    pub join_handles: Vec<JoinHandle<()>>,
+    pub shutdown_sender: broadcast::Sender<()>,
+    pub max_tasks_shutdown_sender: broadcast::Sender<()>,
+    pub node_id: u64,
+    pub orchestrator: OrchestratorClient,
+    pub num_workers: usize,
+}
+
+// Memory & thread control
+const MEMORY_PER_THREAD: u64 = (1.5 * 1024.0 * 1024.0 * 1024.0) as u64;
+
+fn clamp_threads_by_memory(requested_threads: usize) -> usize {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let total_bytes = sys.total_memory() * 1024;
+    requested_threads.min((total_bytes / MEMORY_PER_THREAD).max(1) as usize)
+}
+
+pub fn warn_memory_configuration(max_threads: Option<u32>) {
+    if let Some(threads) = max_threads {
+        let current_pid = Pid::from(std::process::id() as usize);
+        let mut sysinfo = System::new();
+        sysinfo.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[current_pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        if let Some(process) = sysinfo.process(current_pid) {
+            let ram_total = process.memory() * 1024;
+            if threads as u64 * MEMORY_PER_THREAD >= ram_total {
+                crate::print_cmd_warn!(
+                    "⚠️ OOM warning",
+                    "Projected memory usage across {} threads (~1.5GB each) may exceed available memory.",
+                    threads
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+    }
+}
+
+pub async fn setup_session(
+    config: Config,
+    env: Environment,
+    check_mem: bool,
+    max_threads: Option<u32>,
+    max_tasks: Option<u32>,
+    max_difficulty: Option<crate::nexus_orchestrator::TaskDifficulty>,
+) -> Result<SessionData, Box<dyn Error>> {
+    let node_id = config.node_id.parse::<u64>()?;
+    let client_id = config.user_id;
+    let mut csprng = rand_core::OsRng;
+    let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+    let orchestrator_client = OrchestratorClient::new(env.clone());
+    let requested_threads = max_threads.unwrap_or(40) as usize;
+    let mut num_workers = clamp_threads_by_memory(requested_threads);
+    if check_mem { warn_memory_configuration(Some(num_workers as u32)); }
+    let (shutdown_sender, _) = broadcast::channel(1);
+    set_wallet_address_for_reporting(config.wallet_address.clone());
+    let (event_receiver, join_handles, max_tasks_shutdown_sender) = start_authenticated_worker(
+        node_id,
+        signing_key,
+        orchestrator_client.clone(),
+        shutdown_sender.subscribe(),
+        env,
+        client_id,
+        max_tasks,
+        max_difficulty,
+        num_workers,
+    ).await;
+    println!(
+        "✅ Session started: {} workers active (~{} GB estimated RAM)",
+        num_workers,
+        (num_workers as f64 * 1.5).ceil()
+    );
+    Ok(SessionData {
+        event_receiver,
+        join_handles,
+        shutdown_sender,
+        max_tasks_shutdown_sender,
+        node_id,
+        orchestrator: orchestrator_client,
+        num_workers,
+    })
+}
+`;
+
+async function startWorkflow() {
+  log("🚀 Bắt đầu workflow Nexus CLI tự động...");
+
+  // Clone repo nếu chưa có
+  if (!fs.existsSync(PROJECT_PATH)) {
+    run(`git clone https://github.com/nexus-xyz/nexus-cli.git ${PROJECT_PATH}`);
+  }
+
+  // Ghi đè setup.rs
+  const setupPath = path.join(PROJECT_PATH, "clients/cli/src/session/setup.rs");
+  log("📝 Ghi đè setup.rs...");
+  fs.writeFileSync(setupPath, SETUP_RS_CONTENT);
+
+  // Cài Rust nếu chưa có
+  if (!fs.existsSync(path.join(HOME, ".cargo/bin/cargo"))) {
+    log("🦀 Cài Rust...");
+    run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y");
+    run(`source ${HOME}/.cargo/env`);
+  }
+
+  // Build dự án
+  process.chdir(path.join(PROJECT_PATH, "clients/cli"));
+  log("🔧 Build dự án...");
+  try { run("cargo build --release"); }
+  catch (e) { log("❌ Build lỗi, vẫn tiếp tục giám sát tiến trình..."); }
+
+  // Giám sát Nexus CLI
+  function monitor() {
+    const nexus = spawn(
+      "./target/release/nexus-network",
+      ["start", "--node-id", "36952361", "--max-threads", "8", "--max-difficulty", "extra_large_5"],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+
+    nexus.stdout.on("data", d => { log(d.toString()); });
+    nexus.stderr.on("data", d => { log(d.toString()); });
+
+    nexus.on("exit", (code) => {
+      log(`❌ Nexus CLI exited with code ${code}, restarting sau 5s...`);
+      setTimeout(monitor, 5000);
+    });
+
+    log(`✅ Nexus CLI started (PID: ${nexus.pid})`);
+  }
+
+  monitor();
+
+  // Giữ Codespace hoạt động
+  setInterval(() => {
+    log("🟢 Codespace vẫn hoạt động...");
+  }, KEEPALIVE_INTERVAL);
+}
+
+startWorkflow().catch(console.error);
